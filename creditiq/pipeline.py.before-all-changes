@@ -1,0 +1,439 @@
+from __future__ import annotations
+
+import time
+import numpy as np
+import pandas as pd
+
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import (
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    f1_score,
+    log_loss,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import (
+    StratifiedKFold,
+    cross_validate,
+    train_test_split,
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+SUPPORTED_MODELS = (
+    "Logistic Regression",
+    "Random Forest",
+    "HistGradientBoosting",
+)
+
+
+def _build_pipeline(
+    X: pd.DataFrame,
+    model_name: str,
+    random_state: int,
+) -> Pipeline:
+    """Build a leakage-safe preprocessing and classification pipeline."""
+
+    numeric = X.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical = [column for column in X.columns if column not in numeric]
+
+    transformers = []
+
+    if numeric:
+        numeric_pipeline = Pipeline([
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="median",
+                    keep_empty_features=True,
+                ),
+            ),
+            ("scaler", StandardScaler()),
+        ])
+        transformers.append(("num", numeric_pipeline, numeric))
+
+    if categorical:
+        categorical_pipeline = Pipeline([
+            (
+                "imputer",
+                SimpleImputer(
+                    strategy="most_frequent",
+                    keep_empty_features=True,
+                ),
+            ),
+            (
+                "encoder",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=True,
+                ),
+            ),
+        ])
+        transformers.append(
+            ("cat", categorical_pipeline, categorical)
+        )
+
+    prep = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+
+    if model_name == "Logistic Regression":
+        estimator = LogisticRegression(
+            max_iter=1500,
+            class_weight="balanced",
+            solver="liblinear",
+            random_state=random_state,
+        )
+
+    elif model_name == "Random Forest":
+        estimator = RandomForestClassifier(
+            n_estimators=120,
+            min_samples_leaf=3,
+            class_weight="balanced_subsample",
+            n_jobs=-1,
+            random_state=random_state,
+        )
+
+    elif model_name == "HistGradientBoosting":
+        if categorical:
+            categorical_pipeline = Pipeline([
+                (
+                    "imputer",
+                    SimpleImputer(
+                        strategy="most_frequent",
+                        keep_empty_features=True,
+                    ),
+                ),
+                (
+                    "encoder",
+                    OneHotEncoder(
+                        handle_unknown="ignore",
+                        sparse_output=False,
+                    ),
+                ),
+            ])
+
+            transformers = []
+
+            if numeric:
+                transformers.append((
+                    "num",
+                    Pipeline([
+                        (
+                            "imputer",
+                            SimpleImputer(
+                                strategy="median",
+                                keep_empty_features=True,
+                            ),
+                        ),
+                    ]),
+                    numeric,
+                ))
+
+            transformers.append(
+                ("cat", categorical_pipeline, categorical)
+            )
+
+            prep = ColumnTransformer(
+                transformers=transformers,
+                remainder="drop",
+                sparse_threshold=0,
+            )
+
+        estimator = HistGradientBoostingClassifier(
+            max_iter=100,
+            learning_rate=0.08,
+            l2_regularization=1.0,
+            random_state=random_state,
+        )
+
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
+
+    return Pipeline([
+        ("preprocess", prep),
+        ("model", estimator),
+    ])
+
+
+def _safe_metric(function, y_true, predictions) -> float:
+    """Return a metric value without crashing on undefined cases."""
+
+    try:
+        return float(function(y_true, predictions))
+    except (ValueError, TypeError, ZeroDivisionError):
+        return float("nan")
+
+
+def train_and_compare(
+    df: pd.DataFrame,
+    target: str,
+    model_names: list[str],
+    test_size: float = 0.2,
+    cv_folds: int = 5,
+    random_state: int = 42,
+    threshold: float = 0.5,
+) -> dict:
+    """Compare candidate models using training-only cross-validation."""
+
+    started = time.perf_counter()
+
+    if target not in df.columns:
+        raise ValueError(f"Target column '{target}' not found.")
+
+    if not 0.1 <= float(test_size) <= 0.5:
+        raise ValueError("Test size must be between 0.10 and 0.50.")
+
+    if not 0.0 < float(threshold) < 1.0:
+        raise ValueError("Threshold must be between 0 and 1.")
+
+    if not model_names:
+        raise ValueError("Select at least one model.")
+
+    invalid_models = [
+        name for name in model_names
+        if name not in SUPPORTED_MODELS
+    ]
+
+    if invalid_models:
+        raise ValueError(
+            f"Unsupported model selection: {invalid_models}"
+        )
+
+    if len(set(model_names)) != len(model_names):
+        raise ValueError("Duplicate model selections are not allowed.")
+
+    X = df.drop(columns=[target]).copy()
+    y = pd.to_numeric(df[target], errors="raise").astype(int)
+
+    if X.shape[1] == 0:
+        raise ValueError("At least one feature column is required.")
+
+    if y.isna().any() or set(y.unique()) != {0, 1}:
+        raise ValueError("Target must contain only non-missing 0/1 values.")
+
+    class_counts = y.value_counts()
+
+    n_splits = min(int(cv_folds), int(class_counts.min()))
+
+    if n_splits < 2:
+        raise ValueError(
+            "Not enough examples in the minority class for cross-validation."
+        )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=float(test_size),
+        random_state=int(random_state),
+        stratify=y,
+    )
+
+    cv = StratifiedKFold(
+        n_splits=n_splits,
+        shuffle=True,
+        random_state=int(random_state),
+    )
+
+    scoring = {
+        "roc_auc": "roc_auc",
+        "pr_auc": "average_precision",
+        "balanced_accuracy": "balanced_accuracy",
+        "recall": "recall",
+        "precision": "precision",
+        "f1": "f1",
+    }
+
+    models = {}
+    rows = []
+
+    for name in model_names:
+        print(f"[CreditIQ] Cross-validating {name}...", flush=True)
+
+        pipeline = _build_pipeline(
+            X_train,
+            name,
+            int(random_state),
+        )
+
+        scores = cross_validate(
+            pipeline,
+            X_train,
+            y_train,
+            cv=cv,
+            scoring=scoring,
+            n_jobs=1,
+            error_score="raise",
+            return_train_score=False,
+        )
+
+        row = {"model": name}
+
+        for metric in scoring:
+            values = scores[f"test_{metric}"]
+
+            row[f"cv_{metric}_mean"] = float(np.mean(values))
+            row[f"cv_{metric}_std"] = (
+                float(np.std(values, ddof=1))
+                if len(values) > 1
+                else 0.0
+            )
+
+        row["cv_fit_seconds_mean"] = float(
+            np.mean(scores["fit_time"])
+        )
+
+        print(
+            f"[CreditIQ] Fitting final training model: {name}...",
+            flush=True,
+        )
+
+        fitted_model = clone(pipeline).fit(X_train, y_train)
+
+        models[name] = fitted_model
+        rows.append(row)
+
+    summary = (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["cv_pr_auc_mean", "cv_roc_auc_mean"],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    winner_name = str(summary.iloc[0]["model"])
+    winner_model = models[winner_name]
+
+    print(
+        f"[CreditIQ] Evaluating winner: {winner_name}...",
+        flush=True,
+    )
+
+    probabilities = winner_model.predict_proba(X_test)[:, 1]
+    predictions = (
+        probabilities >= float(threshold)
+    ).astype(int)
+
+    holdout_metrics = {
+        "roc_auc": _safe_metric(
+            roc_auc_score, y_test, probabilities
+        ),
+        "pr_auc": _safe_metric(
+            average_precision_score, y_test, probabilities
+        ),
+        "brier": _safe_metric(
+            brier_score_loss, y_test, probabilities
+        ),
+        "log_loss": _safe_metric(
+            log_loss,
+            y_test,
+            np.clip(probabilities, 1e-7, 1 - 1e-7),
+        ),
+        "accuracy": _safe_metric(
+            accuracy_score, y_test, predictions
+        ),
+        "balanced_accuracy": _safe_metric(
+            balanced_accuracy_score, y_test, predictions
+        ),
+        "precision": _safe_metric(
+            precision_score, y_test, predictions
+        ),
+        "recall": _safe_metric(
+            recall_score, y_test, predictions
+        ),
+        "f1": _safe_metric(
+            f1_score, y_test, predictions
+        ),
+    }
+
+    # Keep importance optional: it is supplementary and can be expensive.
+    importance = pd.DataFrame(
+        columns=[
+            "feature",
+            "importance_mean",
+            "importance_std",
+        ]
+    )
+
+    try:
+        print(
+            "[CreditIQ] Calculating permutation importance...",
+            flush=True,
+        )
+
+        # One repeat reduces runtime; these values are approximate.
+        permutation = permutation_importance(
+            winner_model,
+            X_test,
+            y_test,
+            scoring="roc_auc",
+            n_repeats=1,
+            random_state=int(random_state),
+            n_jobs=1,
+        )
+
+        importance = pd.DataFrame({
+            "feature": X_test.columns.astype(str),
+            "importance_mean": permutation.importances_mean,
+            "importance_std": permutation.importances_std,
+        }).sort_values(
+            "importance_mean",
+            ascending=False,
+        ).reset_index(drop=True)
+
+    except Exception as error:
+        print(
+            f"[CreditIQ] Importance skipped: {error}",
+            flush=True,
+        )
+
+    elapsed = time.perf_counter() - started
+
+    print(
+        f"[CreditIQ] Training and evaluation finished in "
+        f"{elapsed:.1f} seconds.",
+        flush=True,
+    )
+
+    return {
+        "winner_name": winner_name,
+        "winner_model": winner_model,
+        "models": models,
+        "summary": summary,
+        "holdout_metrics": holdout_metrics,
+        "y_test": y_test.reset_index(drop=True),
+        "holdout_prob": np.asarray(probabilities),
+        "holdout_pred": np.asarray(predictions),
+        "importance": importance,
+        "features": list(X.columns),
+        "target": target,
+        "threshold": float(threshold),
+        "random_state": int(random_state),
+        "test_size": float(test_size),
+        "cv_folds": int(n_splits),
+        "training_seconds": float(elapsed),
+    }
+
+
+def predict_default_probability(
+    model,
+    X: pd.DataFrame,
+) -> np.ndarray:
+    """Return predicted probability of the positive/default class."""
+
+    return model.predict_proba(X)[:, 1]
